@@ -659,24 +659,162 @@ func RemoveUserSecrets(
 	modelUUID string,
 	canDelete func(*coresecrets.URI) error,
 ) (params.ErrorResults, error) {
-	return removeSecrets(
-		removeState, adminConfigGetter, args, modelUUID, canDelete,
-		func(p provider.SecretBackendProvider, cfg provider.ModelBackendConfig, revs provider.SecretRevisions) error {
-			backend, err := p.NewBackend(&cfg)
+	result := params.ErrorResults{
+		Results: make([]params.ErrorResult, len(args.Args)),
+	}
+
+	if len(args.Args) == 0 {
+		return result, nil
+	}
+	cfgInfo, err := adminConfigGetter()
+	if err != nil {
+		return result, errors.Trace(err)
+	}
+
+	removeFromExternal := func(uri *coresecrets.URI, revisions ...int) ([]int, []error) {
+		// TODO: Is this the right way to prototype this variable?
+		var revs []*coresecrets.SecretRevisionMetadata
+		if len(revisions) == 0 {
+			// Remove all revisions.
+			revs, err = removeState.ListSecretRevisions(uri)
+			if err != nil {
+				return nil, []error{errors.Trace(err)}
+			}
+		} else {
+			revs = make([]*coresecrets.SecretRevisionMetadata, len(revisions))
+			for i, rev := range revisions {
+				revMeta, err := removeState.GetSecretRevision(uri, rev)
+				if err != nil {
+					return nil, []error{errors.Trace(err)}
+				}
+				revs[i] = revMeta
+			}
+		}
+
+		var revisionsDeleted []int
+		var errorsEncountered []error
+		providersToCleanUp := make(map[string]provider.SecretRevisions)
+
+		deleteRevisionFromBackend := func(revisionId string, backendId string) error {
+			p, err := GetProvider(cfgInfo.Configs[backendId].BackendType)
 			if err != nil {
 				return errors.Trace(err)
 			}
-			for _, revId := range revs.RevisionIDs() {
-				if err = backend.DeleteContent(context.TODO(), revId); err != nil {
-					return errors.Trace(err)
-				}
+
+			// delete secret in backend
+			backendCfg := cfgInfo.Configs[backendId]
+			backend, err := p.NewBackend(&backendCfg)
+			if err != nil {
+				return errors.Trace(err)
 			}
-			if err := p.CleanupSecrets(&cfg, authTag, revs); err != nil {
+
+			if err = backend.DeleteContent(context.TODO(), revisionId); err != nil {
 				return errors.Trace(err)
 			}
 			return nil
-		},
-	)
+		}
+
+		for _, rev := range revs {
+			// TODO: This returns on the first error, but we're called with multiple revisions.  Should we instead
+			//  keep a list of any errors encountered and return that?
+			backendId := rev.ValueRef.BackendID
+			revisionId := rev.ValueRef.RevisionID
+
+			for {
+				err := deleteRevisionFromBackend(revisionId, backendId)
+				if err == nil {
+					break
+				}
+				// Capture the any non NotFound error and go to the next revision
+				if err == nil || !errors.Is(err, errors.NotFound) {
+					errorsEncountered = append(errorsEncountered, errors.Trace(err))
+					break
+				}
+
+				// NotFound could be because:
+				// 1. The backend is draining and the secret was moved to the new backend before we accessed it.
+				// 2. The secret is actually missing from the backend.
+				// Check if the revision has moved to a new backend
+				// TODO: I'm pretty sure rev.Revision is the same Revision as needed by GetSecretRevision?
+				updatedRev, err := removeState.GetSecretRevision(uri, rev.Revision)
+				if err != nil {
+					errorsEncountered = append(errorsEncountered, errors.Trace(err))
+					break
+				}
+
+				// If the backend changed, try to delete the secret from the new backend.
+				if backendId != updatedRev.ValueRef.BackendID {
+					backendId = updatedRev.ValueRef.BackendID
+					revisionId = updatedRev.ValueRef.RevisionID
+					continue
+				}
+
+				// Otherwise, the revision really is missing from the backend and we move on.
+				// We tolerate this because our goal is to have that revision removed anyway.
+				// TODO: Log?  In the calling function, if removeState.GetSecret(uri) returns an error
+				//  that is added to the return.  But in here, we might encounter an error for each revision.
+				// TODO: Should we clean up this provider even though we didn't delete the revision?  Maybe it got
+				//  deleted some other way and left configurations dangling in the provider?
+				break
+			}
+
+			// Log this revision to be cleaned up in the provider
+			if _, ok := providersToCleanUp[backendId]; !ok {
+				providersToCleanUp[backendId] = provider.SecretRevisions{}
+			}
+			providersToCleanUp[backendId].Add(uri, rev.ValueRef.RevisionID)
+			// TODO: Should we document a revision as deleted here, or only if the cleanup is successful?
+			revisionsDeleted = append(revisionsDeleted, rev.Revision)
+		}
+
+		// Clean up all providers we've touched
+		for backendId, secretRevisions := range providersToCleanUp {
+			backendCfg := cfgInfo.Configs[backendId]
+			p, err := GetProvider(cfgInfo.Configs[backendId].BackendType)
+			if err != nil {
+				errorsEncountered = append(errorsEncountered, errors.Trace(err))
+			}
+
+			if err := p.CleanupSecrets(&backendCfg, authTag, secretRevisions); err != nil {
+				errorsEncountered = append(errorsEncountered, errors.Trace(err))
+			}
+		}
+
+		return revisionsDeleted, errorsEncountered
+	}
+
+	for i, arg := range args.Args {
+		uri, err := parseDeleteSecretArg(arg, removeState, modelUUID)
+		if err != nil {
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+		if _, err := removeState.GetSecret(uri); err != nil {
+			// Check if the uri exists or not.
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+		if err := canDelete(uri); err != nil {
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+
+		revisionsDeleted, errors := removeFromExternal(uri, arg.Revisions...)
+		if len(errors) > 0 {
+			// TODO: How do we surface these errors?  This gets called somewhere that expectes a single error
+			// We remove the secret from the backend first.
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			// TODO: Can't continue here.  We still need to `DeleteSecret` below for any revisionsDeleted
+			//continue
+		}
+		if _, err = removeState.DeleteSecret(uri, revisionsDeleted...); err != nil {
+			// TODO: This could error on top of removeFromExternal reutrning some errors.  Need to combine or something
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+	}
+	return result, nil
+
 }
 
 func getSecretURIForLabel(secretsState ListSecretsState, modelUUID string, label string) (*coresecrets.URI, error) {
@@ -694,111 +832,4 @@ func getSecretURIForLabel(secretsState ListSecretsState, modelUUID string, label
 		return nil, errors.NotFoundf("more than 1 secret with label %q", label)
 	}
 	return results[0].URI, nil
-}
-
-func removeSecrets(
-	removeState SecretsRemoveState, adminConfigGetter BackendAdminConfigGetter,
-	args params.DeleteSecretArgs,
-	modelUUID string,
-	canDelete func(*coresecrets.URI) error,
-	removeFromBackend func(provider.SecretBackendProvider, provider.ModelBackendConfig, provider.SecretRevisions) error,
-) (params.ErrorResults, error) {
-	result := params.ErrorResults{
-		Results: make([]params.ErrorResult, len(args.Args)),
-	}
-
-	if len(args.Args) == 0 {
-		return result, nil
-	}
-	cfgInfo, err := adminConfigGetter()
-	if err != nil {
-		return result, errors.Trace(err)
-	}
-
-	removeFromExternal := func(uri *coresecrets.URI, revisions ...int) error {
-		externalRevs := make(map[string]provider.SecretRevisions)
-		gatherExternalRevs := func(valRef *coresecrets.ValueRef) {
-			if valRef == nil {
-				// Internal secret, nothing to do here.
-				return
-			}
-			if _, ok := externalRevs[valRef.BackendID]; !ok {
-				externalRevs[valRef.BackendID] = provider.SecretRevisions{}
-			}
-			externalRevs[valRef.BackendID].Add(uri, valRef.RevisionID)
-		}
-		if len(revisions) == 0 {
-			// Remove all revisions.
-			revs, err := removeState.ListSecretRevisions(uri)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			for _, rev := range revs {
-				gatherExternalRevs(rev.ValueRef)
-			}
-		} else {
-			for _, rev := range revisions {
-				revMeta, err := removeState.GetSecretRevision(uri, rev)
-				if err != nil {
-					return errors.Trace(err)
-				}
-				gatherExternalRevs(revMeta.ValueRef)
-			}
-		}
-
-		for backendID, r := range externalRevs {
-			backendCfg, ok := cfgInfo.Configs[backendID]
-			if !ok {
-				return errors.NotFoundf("secret backend %q", backendID)
-			}
-			provider, err := GetProvider(backendCfg.BackendType)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			if err := removeFromBackend(provider, backendCfg, r); err != nil {
-				return errors.Trace(err)
-			}
-		}
-		return nil
-	}
-
-	for i, arg := range args.Args {
-		if arg.URI == "" && arg.Label == "" {
-			result.Results[i].Error = apiservererrors.ServerError(errors.New("must specify either URI or label"))
-			continue
-		}
-
-		var (
-			uri *coresecrets.URI
-			err error
-		)
-		if arg.URI != "" {
-			uri, err = coresecrets.ParseURI(arg.URI)
-		} else {
-			uri, err = getSecretURIForLabel(removeState, modelUUID, arg.Label)
-		}
-		if err != nil {
-			result.Results[i].Error = apiservererrors.ServerError(err)
-			continue
-		}
-		if _, err := removeState.GetSecret(uri); err != nil {
-			// Check if the uri exists or not.
-			result.Results[i].Error = apiservererrors.ServerError(err)
-			continue
-		}
-		if err := canDelete(uri); err != nil {
-			result.Results[i].Error = apiservererrors.ServerError(err)
-			continue
-		}
-		if err := removeFromExternal(uri, arg.Revisions...); err != nil {
-			// We remove the secret from the backend first.
-			result.Results[i].Error = apiservererrors.ServerError(err)
-			continue
-		}
-		if _, err = removeState.DeleteSecret(uri, arg.Revisions...); err != nil {
-			result.Results[i].Error = apiservererrors.ServerError(err)
-			continue
-		}
-	}
-	return result, nil
 }
