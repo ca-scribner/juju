@@ -609,14 +609,46 @@ func RemoveSecretsForAgent(
 	modelUUID string,
 	canDelete func(*coresecrets.URI) error,
 ) (params.ErrorResults, error) {
-	return removeSecrets(
-		removeState, adminConfigGetter, args,
-		modelUUID,
-		canDelete,
-		func(provider.SecretBackendProvider, provider.ModelBackendConfig, provider.SecretRevisions) error {
-			return nil
-		},
-	)
+	result := params.ErrorResults{
+		Results: make([]params.ErrorResult, len(args.Args)),
+	}
+
+	for i, arg := range args.Args {
+		uri, err := parseDeleteSecretArg(arg, removeState, modelUUID)
+		if err != nil {
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+		if _, err := removeState.GetSecret(uri); err != nil {
+			// Check if the uri exists or not.
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+		if err := canDelete(uri); err != nil {
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+		if _, err = removeState.DeleteSecret(uri, arg.Revisions...); err != nil {
+			result.Results[i].Error = apiservererrors.ServerError(err)
+			continue
+		}
+		// TODO: Did I miss a cleanup from before?
+	}
+	return result, nil
+}
+
+// parseDeleteSecretArg parses arguments for secret deletion, returning the secret URI
+func parseDeleteSecretArg(arg params.DeleteSecretArg, removeState SecretsRemoveState, modelUUID string) (*coresecrets.URI, error) {
+	if arg.URI == "" && arg.Label == "" {
+		return nil, errors.New("must specify either URI or label")
+	}
+	if arg.URI != "" {
+		return coresecrets.ParseURI(arg.URI)
+	}
+	if arg.Label != "" {
+		return getSecretURIForLabel(removeState, modelUUID, arg.Label)
+	}
+	return nil, errors.New("must specify either URI or label")
 }
 
 // RemoveUserSecrets removes the specified user supplied secrets.
