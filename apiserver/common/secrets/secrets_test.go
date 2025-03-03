@@ -813,10 +813,12 @@ func (s *secretsSuite) TestRemoveSecretsForSecretOwnersWithRevisions(c *gc.C) {
 	s.PatchValue(&secrets.GetProvider, func(string) (provider.SecretBackendProvider, error) { return mockprovider, nil })
 
 	removeState.EXPECT().GetSecret(&expectURI).Return(&coresecrets.SecretMetadata{}, nil)
-	removeState.EXPECT().GetSecretRevision(&expectURI, 666).Return(&coresecrets.SecretRevisionMetadata{
-		Revision: 666,
-		ValueRef: &coresecrets.ValueRef{BackendID: "backend-id", RevisionID: "rev-666"},
-	}, nil)
+	// TODO: Test fails because we don't call GetSecretRevision during RemoveSecretsForAgent anymore.
+	//  I don't think we ever needed to, and the new code path doesn't at all.  Remove this?
+	//removeState.EXPECT().GetSecretRevision(&expectURI, 666).Return(&coresecrets.SecretRevisionMetadata{
+	//	Revision: 666,
+	//	ValueRef: &coresecrets.ValueRef{BackendID: "backend-id", RevisionID: "rev-666"},
+	//}, nil)
 	removeState.EXPECT().DeleteSecret(&expectURI, []int{666}).Return([]coresecrets.ValueRef{{
 		BackendID:  "backend-id",
 		RevisionID: "rev-666",
@@ -867,15 +869,17 @@ func (s *secretsSuite) TestRemoveSecretsForSecretOwners(c *gc.C) {
 	s.PatchValue(&secrets.GetProvider, func(string) (provider.SecretBackendProvider, error) { return mockprovider, nil })
 
 	removeState.EXPECT().GetSecret(&expectURI).Return(&coresecrets.SecretMetadata{}, nil)
-	removeState.EXPECT().ListSecretRevisions(&expectURI).Return(
-		[]*coresecrets.SecretRevisionMetadata{
-			{
-				Revision: 666,
-				ValueRef: &coresecrets.ValueRef{BackendID: "backend-id", RevisionID: "rev-666"},
-			},
-		},
-		nil,
-	)
+	// TODO: Test fails because we don't call ListSecretRevisions during RemoveSecretsForAgent anymore.
+	//  I don't think we ever needed to, and the new code path doesn't at all.  Remove this?
+	//removeState.EXPECT().ListSecretRevisions(&expectURI).Return(
+	//	[]*coresecrets.SecretRevisionMetadata{
+	//		{
+	//			Revision: 666,
+	//			ValueRef: &coresecrets.ValueRef{BackendID: "backend-id", RevisionID: "rev-666"},
+	//		},
+	//	},
+	//	nil,
+	//)
 	removeState.EXPECT().DeleteSecret(&expectURI, []int{}).Return([]coresecrets.ValueRef{{
 		BackendID:  "backend-id",
 		RevisionID: "rev-666",
@@ -918,6 +922,7 @@ func ptr[T any](v T) *T {
 	return &v
 }
 
+// TODO: Rename to include Agent in the name?
 func (s *secretsSuite) TestRemoveSecretsByLabel(c *gc.C) {
 	ctrl := gomock.NewController(c)
 	defer ctrl.Finish()
@@ -935,15 +940,17 @@ func (s *secretsSuite) TestRemoveSecretsByLabel(c *gc.C) {
 		URI: uri,
 	}}, nil)
 	removeState.EXPECT().GetSecret(&expectURI).Return(&coresecrets.SecretMetadata{}, nil)
-	removeState.EXPECT().ListSecretRevisions(&expectURI).Return(
-		[]*coresecrets.SecretRevisionMetadata{
-			{
-				Revision: 666,
-				ValueRef: &coresecrets.ValueRef{BackendID: "backend-id", RevisionID: "rev-666"},
-			},
-		},
-		nil,
-	)
+	// TODO: Test fails because we don't call ListSecretRevisions during RemoveSecretsForAgent anymore.
+	//  I don't think we ever needed to, and the new code path doesn't at all.  Remove this?
+	//removeState.EXPECT().ListSecretRevisions(&expectURI).Return(
+	//	[]*coresecrets.SecretRevisionMetadata{
+	//		{
+	//			Revision: 666,
+	//			ValueRef: &coresecrets.ValueRef{BackendID: "backend-id", RevisionID: "rev-666"},
+	//		},
+	//	},
+	//	nil,
+	//)
 	removeState.EXPECT().DeleteSecret(&expectURI, []int{}).Return([]coresecrets.ValueRef{{
 		BackendID:  "backend-id",
 		RevisionID: "rev-666",
